@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/vllm-project/vllm.git",
+  "commit": "96c80f8af766a1d206d92d2fb01bb92234b9b443",
+  "files": {
+    "vllm/v1/worker/gpu/sample/logprob.py": "ac58bfedaa325ae29e7b652063455239c7354a2af4751396930d5670f890ce2d",
+    "vllm/v1/outputs.py": "58cd064fa44182f2d9543b0ea1eee05d59f304293dd40e423ea7286f4d265bf7"
+  }
+}
