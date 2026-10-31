@@ -16,6 +16,27 @@ def original():
     return fn
 
 
+def reference_output(original, x, k, sampled, **kwargs):
+    """Only skip int32 gather when the installed original actually rejects it."""
+    try:
+        return original(x, k, sampled, **kwargs)
+    except RuntimeError as error:
+        message = str(error).lower()
+        int32_gather = (
+            kwargs.get("logits_mode", False)
+            and sampled.dtype == torch.int32
+            and (k == 0 or kwargs.get("max_per_req_token_ids", 0) > 0)
+        )
+        if (
+            int32_gather
+            and "gather" in message
+            and "dtype" in message
+            and "int64" in message
+        ):
+            pytest.skip(f"installed original rejects int32 gather: {error}")
+        raise
+
+
 @pytest.mark.parametrize("batch", [1, 2, 8, 32])
 @pytest.mark.parametrize("vocab", [128, 1024, 32000, 64000, 128000])
 @pytest.mark.parametrize("k", [1, 5, 10, 20, 50])
@@ -82,14 +103,11 @@ def test_special_values(original, case, logits_mode, dtype):
 def test_strided_rows_extreme_samples_and_metadata(original, k, id_dtype, logits_mode):
     x = torch.arange(128, device="cuda", dtype=torch.float32).repeat(4, 1)[::2]
     sampled = torch.tensor([127, 0], device="cuda", dtype=id_dtype)
-    # Upstream gather in logits_mode requires int64 when K=0.
-    if logits_mode and k == 0 and id_dtype == torch.int32:
-        pytest.skip("upstream gather rejects int32 indices")
     for boundaries in ([0, 1, 2], torch.tensor([0, 1, 2], device="cuda"), None):
         kwargs = {"cu_num_logits": boundaries, "logits_mode": logits_mode}
         compare_outputs(
             x,
-            original(x, k, sampled, **kwargs),
+            reference_output(original, x, k, sampled, **kwargs),
             compute_topk_scores_cuda(x, k, sampled, **kwargs),
             exact_ids=True,
         )
@@ -98,32 +116,35 @@ def test_strided_rows_extreme_samples_and_metadata(original, k, id_dtype, logits
 @pytest.mark.parametrize("k", [0, 5, 20])
 @pytest.mark.parametrize("logits_mode", [False, True])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_mixed_custom_lists(original, k, logits_mode, id_dtype):
-    if logits_mode and id_dtype == torch.int32:
-        pytest.skip("upstream gather rejects int32 custom output indices")
-    x = torch.arange(1031, device="cuda", dtype=torch.float32).repeat(3, 1)
-    sampled = torch.tensor([4, 6, 9], device="cuda", dtype=id_dtype)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("custom_width", [3, 128])
+def test_mixed_custom_lists(original, k, logits_mode, id_dtype, dtype, custom_width):
+    # Ordinary rows have ties; custom rows retain ordering, duplicates and padding.
+    x = (torch.arange(1031, device="cuda") % 13).to(dtype).repeat(4, 1)
+    sampled = torch.tensor([4, 6, 9, 10], device="cuda", dtype=id_dtype)
+    custom_ids = torch.zeros(3, custom_width, device="cuda", dtype=torch.int32)
+    custom_ids[1] = torch.arange(custom_width, device="cuda", dtype=torch.int32) % 7
+    custom_ids[2, :2] = torch.tensor([8, 5], device="cuda", dtype=torch.int32)
     state = SimpleNamespace(
         num_token_ids=SimpleNamespace(
-            gpu=torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+            gpu=torch.tensor([0, custom_width, 2], device="cuda", dtype=torch.int32)
         ),
-        token_ids=SimpleNamespace(
-            gpu=torch.tensor([[0, 0, 0], [5, 5, 7]], device="cuda", dtype=torch.int32)
-        ),
+        token_ids=SimpleNamespace(gpu=custom_ids),
     )
     kwargs = {
         "logprob_token_ids_state": state,
         "expanded_idx_mapping": torch.tensor(
-            [1, 0, 1], device="cuda", dtype=torch.int32
+            [1, 0, 2, 1], device="cuda", dtype=torch.int32
         ),
-        "max_per_req_token_ids": 3,
+        "max_per_req_token_ids": custom_width,
         "logits_mode": logits_mode,
     }
     compare_outputs(
         x,
-        original(x, k, sampled, **kwargs),
+        reference_output(original, x, k, sampled, **kwargs),
         compute_topk_scores_cuda(x, k, sampled, **kwargs),
-        custom=True,
+        custom_counts=[custom_width, 0, 2, custom_width],
+        num_logprobs=k,
     )
 
 
@@ -162,8 +183,24 @@ def test_real_vllm_custom_state(original):
         x,
         original(x, 5, sampled, **kwargs),
         compute_topk_scores_cuda(x, 5, sampled, **kwargs),
-        custom=True,
+        custom_counts=[3, 0],
+        num_logprobs=5,
     )
+
+
+@pytest.mark.parametrize("vocab", [8191, 8192, 8193])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_rank_padding_boundary(original, vocab, dtype):
+    x = torch.zeros(3, vocab, device="cuda", dtype=dtype)
+    x[0].fill_(-torch.inf)
+    x[1, 0] = -torch.inf
+    # Row 2's sampled zero ties with all vocab entries, without padding matches.
+    sampled = torch.zeros(3, device="cuda", dtype=torch.int64)
+    ref = original(x, 5, sampled)
+    got = compute_topk_scores_cuda(x, 5, sampled)
+    compare_outputs(x, ref, got)
+    padded = ((vocab + 8191) // 8192) * 8192
+    assert got.selected_token_ranks.tolist() == [padded, padded, vocab]
 
 
 def test_k_exceeding_tile_width(original):

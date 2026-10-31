@@ -45,6 +45,11 @@ def compute_topk_scores_cuda(
     score -inf. logits_mode emits gathered raw logits instead of logprobs.
     cu_num_logits (list/Tensor/None) is passed through without copying.
 
+    Intended workload: small K (1/5/10/20/50). Large-vocabulary K=V is accepted
+    but has not been validated or optimized. Equal logits may produce different
+    Top-K IDs/order than upstream, including different positional ranks in
+    vLLM's downstream output formatting. This is not strict API-output parity.
+
     Original execution: torch.topk -> cat/custom Triton assembly -> Triton
     log-softmax gather (or torch.gather) -> optional masked_fill -> Triton rank.
     CUDA execution: tile selection -> merge/assembly -> scores -> rank.
